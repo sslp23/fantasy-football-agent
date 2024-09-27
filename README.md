@@ -9,7 +9,7 @@ Currently, the project is in the early stage, focusing on **news analysis** for 
 This project relies on several Python libraries to achieve its goals:
 
 - **Google Gemini**: Used for natural language processing and news retrieval.
-- **Instructor**: Handles data preprocessing and model training for player analysis.
+- **Instructor**: Used to handle and structure the output of LLMs
 - **Pydantic**: Ensures data validation and settings management.
 - **Sleeper**: Provides integration with the Sleeper fantasy football platform for player data.
 
