@@ -1,15 +1,15 @@
 import instructor
 import google.generativeai as genai
 from pydantic import BaseModel, Field, create_model
-from typing import Callable, Literal
+from typing import Literal
 
 from utils import *
 from scraper import *
 from sleeper import *
 import pandas as pd
 import inspect
-import ast
 import time
+import ast
 
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -68,7 +68,7 @@ def get_news(player_name: str, link: str):
 
     news = [h.text+' '+t.text for h, t in zip(headlines, texts)]
     heads = [h.text for h in headlines]
-    news_infos = {'Player': player_name, 'News': news, 'Headlines': heads}
+    news_infos = {'Player': [player_name]*len(news), 'News': news, 'Headlines': heads}
     return news_infos
 
 class Agent:
@@ -140,7 +140,7 @@ class Agent:
         
         return news_with_labels
     
-    def news_agent(self, players: FantasyInfos) -> list:
+    def news_agent(self, players: FantasyInfos, labelling: bool = False) -> str:
         class PlayerInfo(BaseModel):
             name: str
             team: str
@@ -152,30 +152,38 @@ class Agent:
 
         news_data = pd.read_csv('data/cnbc_players.csv')
         all_players = []
+        #news_output = ''
         for player in players.infos:
             if player.position != 'DEF':
                 info = self.retrieve(player.name, news_data.to_markdown(), Squad).infos[0]
                 player_infos = get_news(info.name, info.link)
                 
                 all_players.append(player_infos)
+        
+                #news_output += all_players['Player']+'-'+all_players['Headlines'] + all_players['News']
+        if labelling:
+            all_players = self.news_classify(all_players)
+        
+        all_players = pd.concat([pd.DataFrame(a) for a in all_players])
             
-        return all_players
+        return all_players.to_markdown()
 
     def get_function_details(self, func):
         # Get the signature of the function
         signature = inspect.signature(func)
-        
-        # Create a list of tuples (argument, argument_type)
+
+        # Create a list of tuples (argument, argument_type, default_value)
         arg_details = [
-            (param_name, str(param.annotation.__name__) if param.annotation != inspect.Parameter.empty else 'Any')
+            (
+                param_name,
+                str(param.annotation.__name__) if param.annotation != inspect.Parameter.empty else 'Any',
+                param.default if param.default != inspect.Parameter.empty else 'No default'
+            )
             for param_name, param in signature.parameters.items()
         ]
-        
-        # Convert the list of tuples to a string with comma separation
-        #arg_details_str = ', '.join([f"{arg}, type: {arg_type}" for arg, arg_type in arg_details])
-        #arg_details_args = ', '.join([f"({arg_type})" for arg, arg_type in arg_details])
-        #print(arg_details)
-        arg_details_str = pd.DataFrame([(arg,arg_type) for arg, arg_type in arg_details], columns=['Name', 'Type']).to_markdown()
+
+        # Convert the list of tuples to a DataFrame
+        arg_details_str = pd.DataFrame(arg_details, columns=['Name', 'Type', 'Default Value'])
         return arg_details_str
 
     def run(self, prompt):
@@ -187,10 +195,9 @@ class Agent:
 
         You have access to the following agents:
 
-        - news_agent -> retrieve news of the players
-        - news_classify -> label the news as positive or negative
+        - news_agent -> retrieve news of the players and if required, label it as positive, neutral or negative.
 
-        If the answer can be answered without this agent, you don't need to use it, so return an empty string.
+        If the answer can be answered without an agent, you don't need to use it, so return an empty string.
         You don't need to use all agents. Use only the one explicit found in the question.
         
         An example of output:
@@ -200,43 +207,73 @@ class Agent:
         player_retrieve_context = f"# User roster: {self.user_roster.to_markdown()}\n # Other rosters: {self.rosters.to_markdown()}"
         
         players = self.retrieve(prompt, player_retrieve_context, FantasyInfos)
+        
         plan = self.planner(plan_instruction, Plan)
 
         agents = plan.agents
         outputs = []
         for agent in agents.split('->'):
             func_args = self.get_function_details(getattr(self, agent))
+            non_default_args = func_args[func_args['Default Value'] == 'No default'][['Name', 'Type']]
+            default_args = func_args[func_args['Default Value'] != 'No default'][['Name', 'Type']]
+
             local_vars = locals()
             #possible_params = ', '.join([f"{var}, type: {type(value).__name__}" for var, value in local_vars.items()])
             possible_params = pd.DataFrame([(var, type(value).__name__) for var, value in local_vars.items()], columns=['Name', 'Type']).to_markdown()
-            exp = f'''
-                You must find the parameters for function {agent} based on the question {prompt} and the plan {agents}.
-                The function agent expect the following pattern of parameters:
-                {func_args}
+            if len(func_args)>0:
+                exp = f'''
+                    You must find the parameters for function {agent} based on the question {prompt} and the plan {agents}.
 
-                You must select based only on the values below. The parameters selected must have the same type, but can have a different name:
-                {possible_params}
-                
-                
-                You must return an str with arguments separated by ",".
-            '''
-            args = self.basic_qa(exp, BasicOutput).output
+                    You must select {len(non_default_args)} parameters. The Type column must be {non_default_args.Type.values}.
+                    The values must be selected only from the Name column:
+                    {possible_params}
+                    
+                    You must return an str with arguments separated by ",".
+                '''
+                non_default_args = self.basic_qa(exp, BasicOutput).output
+
+                exp = f'''
+                    You must find the parameters for function {agent} based on the question {prompt} and the plan {agents}.
+
+                    You must select {len(default_args)} parameters. The type of the value must be {default_args.Type.values}.
+                    
+                    For example, if type is bool, you can select between True or False.
+
+                    You must return an str with arguments separated by ",".
+
+                    Return only the value of the argument, not the name of the argument.
+                '''
+                default_args = self.basic_qa(exp, BasicOutput).output
+
+                args = non_default_args+','+default_args
 
             print(agent, args)
             args_vars = []
             for arg in args.split(','):
-                args_vars.append(locals()[arg])
+                if arg in locals().keys():
+                    args_vars.append(locals()[arg])
+                else:
+                    args_vars.append(ast.literal_eval(arg))
             
             output = getattr(self, agent)(*tuple(args_vars))
             outputs.append(output)
             locals()[agent+'_output'] = output
 
-        return outputs
+        conclusion = f'''
+        Based on {outputs}, answer the question {prompt}.
+
+        You can use {outputs} to help the answer.
+        '''
+        print(conclusion)
+        text_conclusion = self.basic_qa(conclusion, BasicOutput).output
+        
+        return text_conclusion
     
 a = Agent(LEAGUE_ID, USER_ID)
 
-test = a.run('Get the news of my team labeled as positive or negative.')
+test = a.run('Get the news of Alvin Kamara labeled.')
 
-test
+a.run('Get the news of Alvin Kamara.')
+
 
 a.news_agent('Jordan Mason')
